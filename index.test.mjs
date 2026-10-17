@@ -534,6 +534,38 @@ test("rewriteSseChunk rewrites reasoning-only frames and keeps the framing", () 
   assert.equal(x.rewriteSseChunk("data: [DONE]\n\n"), "data: [DONE]\n\n")
 })
 
+test("the output budget is clamped to what the gateway accepts", async () => {
+  const cred = await makeCred()
+  const sent = []
+  const fetcher = async (url, init) => {
+    sent.push(JSON.parse(new TextDecoder().decode(init.body ?? new Uint8Array())))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], max_completion_tokens: 128000 }),
+  })
+  assert.equal(sent[0].max_completion_tokens, x.MAX_OUTPUT_TOKENS)
+  // A budget inside the range is left alone.
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], max_completion_tokens: 1024 }),
+  })
+  assert.equal(sent[1].max_completion_tokens, 1024)
+})
+
+test("model limits declare a usable output budget", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
+  const config = {}
+  await plugin.config(config)
+  const m = config.provider.codearts.models["GLM-5.2"]
+  assert.equal(m.limit.output, x.MAX_OUTPUT_TOKENS)
+})
+
 // ---- streaming-slot ledger ---------------------------------------------------
 
 test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {

@@ -122,6 +122,10 @@ let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
 const SESSION_LIMIT_ERROR = "TM.00001041"
 // The temporary AK/SK/security-token went stale (IAM rejects the call).
 const STALE_TOKEN_ERROR = "APIG.0602"
+// The gateway refuses a bigger output budget (RANGE_VALIDATOR: max_completion
+// tokens must be between 0 and 65536). Declaring no limit made callers pass
+// their own default, which is over it.
+const MAX_OUTPUT_TOKENS = 65_536
 const SESSION_SLOTS = 3
 // How long the gateway keeps a finished streaming session occupied.
 const SESSION_HOLD_MS = 60_000
@@ -904,6 +908,18 @@ async function signedFetch(cred, input, init, context) {
     raw.model = raw.model.slice(PROVIDER.length + 1)
     body = utf8(JSON.stringify(raw))
   }
+  // Keep the output budget inside what the gateway accepts, whatever default
+  // the caller picked.
+  if (raw) {
+    let clamped = false
+    for (const k of ["max_completion_tokens", "max_tokens"]) {
+      if (typeof raw[k] === "number" && raw[k] > MAX_OUTPUT_TOKENS) {
+        raw[k] = MAX_OUTPUT_TOKENS
+        clamped = true
+      }
+    }
+    if (clamped) body = utf8(JSON.stringify(raw))
+  }
   const model = raw?.model
   const streaming = raw?.stream === true
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
@@ -995,6 +1011,8 @@ async function signedFetch(cred, input, init, context) {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   // SSE frames can split across chunks: hold the trailing partial line back.
+  // Pass frames through untouched unless one carries reasoning-only content;
+  // only then buffer a partial line so the JSON can be rebuilt.
   let pending = ""
   const stream = new ReadableStream({
     async pull(controller) {
@@ -1002,14 +1020,24 @@ async function signedFetch(cred, input, init, context) {
         const { done, value } = await reader.read()
         if (done) {
           releaseSlot(slot, slotKey)
-          if (pending) controller.enqueue(encoder.encode(rewriteSseChunk(pending)))
+          if (pending) {
+            controller.enqueue(encoder.encode(rewriteSseChunk(pending)))
+            pending = ""
+          }
           controller.close()
           return
         }
         const text = pending + decoder.decode(value, { stream: true })
+        if (!text.includes("reasoning_content")) {
+          // Nothing to fold: forward the bytes as they arrived.
+          pending = ""
+          controller.enqueue(encoder.encode(text))
+          return
+        }
         const cut = text.lastIndexOf("\n")
         if (cut < 0) {
           pending = text
+          controller.enqueue(new Uint8Array()) // keep pull() flowing
           return
         }
         pending = text.slice(cut + 1)
@@ -1179,7 +1207,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
 
   const configModel = (m) => ({
     name: m.name ?? m.id,
-    limit: { context: m.context ?? 0, output: 0 },
+    limit: { context: m.context ?? 0, output: MAX_OUTPUT_TOKENS },
     tool_call: true,
   })
 
@@ -1189,7 +1217,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       ...base,
       id: live.id,
       name: live.name || base.name || live.id,
-      limit: { context: live.context ?? base.limit?.context ?? 0, output: 0 },
+      limit: { context: live.context ?? base.limit?.context ?? 0, output: MAX_OUTPUT_TOKENS },
     }
   }
 
@@ -1394,5 +1422,5 @@ export const _internal = {
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   foldReasoningIntoContent, rewriteSseChunk,
   sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
-  SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS,
+  SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS, MAX_OUTPUT_TOKENS,
 }
