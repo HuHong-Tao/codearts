@@ -499,6 +499,20 @@ test("the provider prefix is stripped from the model id before signing", async (
   assert.equal(parsed.stream, true)
 })
 
+test("accountIdentityOf reads the signer out of the refresh token profile", () => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url")
+  const profile = b64({ account_id: "A1", account_name: "acme", principal_urn: "iam::A1:user:alice" })
+  const jwt = `${b64({ alg: "RS256" })}.${b64({ user_profile: profile })}.sig`
+  assert.equal(x.accountIdentityOf({ refresh_token: jwt }), "iam::A1:user:alice")
+  // Falls back to the account name when the URN is absent.
+  const bare = `${b64({ alg: "RS256" })}.${b64({ user_profile: b64({ account_name: "acme" }) })}.sig`
+  assert.equal(x.accountIdentityOf({ refresh_token: bare }), "acme")
+  // Anything unusable must not invent an identity.
+  assert.equal(x.accountIdentityOf({}), "")
+  assert.equal(x.accountIdentityOf({ refresh_token: "not-a-jwt" }), "")
+  assert.equal(x.accountIdentityOf({ refresh_token: "a.b.c" }), "")
+})
+
 // ---- streaming-slot ledger ---------------------------------------------------
 
 test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {

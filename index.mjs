@@ -431,6 +431,26 @@ async function refreshCredential(cred, fetcher) {
   return next
 }
 
+/**
+ * Who signed in, so magpie recognises a re-login as the SAME account instead of
+ * opening a new `codearts#<slot>` every time. The STS answer carries no user
+ * fields — its refresh_token is a JWT whose `user_profile` claim holds them.
+ */
+function accountIdentityOf(cred) {
+  const token = typeof cred?.refresh_token === "string" ? cred.refresh_token : ""
+  if (token.split(".").length !== 3) return ""
+  try {
+    const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")
+    const payload = safeJson(atob(part + "=".repeat((4 - (part.length % 4)) % 4)))
+    const profile = typeof payload?.user_profile === "string"
+      ? safeJson(atob(payload.user_profile.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (payload.user_profile.length % 4)) % 4)))
+      : payload?.user_profile
+    return firstOf(profile?.principal_urn, profile?.account_name, profile?.account_id)
+  } catch {
+    return ""
+  }
+}
+
 // ---- OAuth login: URL + loopback callback ----------------------------------
 
 /** Build the Huawei Cloud portal authorize URL (params mirror the real IDE). */
@@ -1270,7 +1290,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
                   const outcome = await flow.result
                   const cred = safeJson(outcome.access)
                   if (!cred?.access_key_id) return { type: "failed", error: "CodeArts did not return a credential" }
-                  const accountId = firstOf(cred.user_name, cred.user_id)
+                  const accountId = accountIdentityOf(cred) || firstOf(cred.user_name, cred.user_id)
                   return {
                     type: "success",
                     access: outcome.access,
@@ -1320,7 +1340,7 @@ export const _internal = {
   buildCanonicalRequest, signRequestHuawei,
   credentialFromTokenResponse, credentialOf, expiresFromCredential,
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
-  buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
+  buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential, accountIdentityOf,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
