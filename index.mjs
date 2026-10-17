@@ -41,6 +41,9 @@
 // signed-request flow. See README.md / DESIGN.md.
 
 import { createServer } from "node:http"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 const PROVIDER = "codearts"
 const NPM = "@ai-sdk/openai-compatible" // chat completions
@@ -98,16 +101,36 @@ const CORS_HEADERS = {
 const BENEFIT_MODEL_FALLBACK = ["glm-5.3-flash", "deepseek-v4.1-flash"]
 let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
 
-// The gateway counts every distinct `Chat-Id` as a concurrent session and caps
-// an account at 3; a finished session keeps its slot for a while after the
-// response. Opening a session per request (or even per process) therefore
-// pinned the counter and every further chat died with HTTP 400 TM.00001041
-// ("并发会话数已达上限(3个)"). The plugin derives both session headers from the
-// account, so every process and every device running the same account shares
-// ONE upstream session whatever the call frequency, and — for the slots other
-// clients on the same account hold — retries this error with backoff before
-// giving up.
+// The upstream caps an account at 3 CONCURRENT SESSIONS and answers every
+// further STREAMING request with HTTP 400 TM.00001041 ("并发会话数已达上限
+// (3个)"). A streaming session keeps its slot for ~60 s after its response
+// finishes, while a non-streaming request takes no slot at all (measured:
+// 3 rapid `stream: true` calls then the 4th rejected for 59 s; 6 rapid
+// `stream: false` calls all 200). Agents stream every turn, so an agent that
+// asks three times within a minute used to be bricked.
+//
+// The plugin therefore keeps its own slot ledger: a streaming request waits
+// for a free slot, and a TM.00001041 that still leaks through — another client
+// on the same account holds the slots — is retried with backoff.
+//
+// Waiting the full 60 s would blow every agent's request deadline, so a
+// request that cannot get a slot within SESSION_WAIT_MS is downgraded to a
+// NON-streaming call (which takes no slot and is answered at once) and handed
+// back to the caller as a one-shot SSE body: same content, no incremental
+// chunks. A short turn pays nothing, a burst degrades gracefully instead of
+// failing, and the next turn streams normally again once slots free up.
 const SESSION_LIMIT_ERROR = "TM.00001041"
+// The temporary AK/SK/security-token went stale (IAM rejects the call).
+const STALE_TOKEN_ERROR = "APIG.0602"
+const SESSION_SLOTS = 3
+// How long the gateway keeps a finished streaming session occupied.
+const SESSION_HOLD_MS = 60_000
+// After the ledger says a slot is free, let it overshoot a little.
+const SESSION_SLOT_MARGIN_MS = 800
+// How long a streaming request waits before taking the non-streaming route.
+// Short on purpose: a degraded call still has to pay its own round trip, and
+// agent clients cut the whole request off at ~15 s.
+const SESSION_WAIT_MS = 6_000
 // Even polling rather than a long-tail exponential curve: slots free on their
 // own within a minute or so, and a client deadline should catch a poll.
 const SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 15_000]
@@ -647,6 +670,117 @@ function sleepWithJitter(ms) {
   return new Promise((r) => setTimeout(r, Math.round(ms * (0.75 + Math.random() * 0.5))))
 }
 
+const initAborted = (signal) => Boolean(signal?.aborted)
+const abortError = () => new DOMException("The operation was aborted.", "AbortError")
+
+/** Wait `ms`, or reject as soon as `signal` aborts. */
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError())
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener?.("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * The streaming-slot ledger every loader of this plugin process shares.
+ *
+ * The gateway allows 3 concurrent streaming sessions per ACCOUNT and holds a
+ * finished one for ~60 s; a non-streaming request takes no slot at all. Each
+ * slot is keyed by the account credential, so every conversation on one
+ * account draws on the same 3 slots instead of opening a 4th streaming
+ * session that the gateway refuses with TM.00001041.
+ *
+ * The ledger lives in a file next to the plugin's other state, because the
+ * gateway is not the only process that streams: `magpie provider test`, the
+ * TUI and every freshly spawned plugin host each run the plugin themselves,
+ * and a ledger private to one process would hand each of them its own 3 slots.
+ */
+const SLOT_STATE_FILE = process.env.MAGPIE_CODEARTS_SLOT_FILE
+  ?? path.join(process.env.HOME ?? os.homedir(), ".config", "magpie", "codearts-slots.json")
+
+function readSlotFile() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(SLOT_STATE_FILE, "utf8"))
+    return raw && typeof raw === "object" ? raw : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeSlotFile(state) {
+  try {
+    fs.mkdirSync(path.dirname(SLOT_STATE_FILE), { recursive: true })
+    const tmp = `${SLOT_STATE_FILE}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(state))
+    fs.renameSync(tmp, SLOT_STATE_FILE)
+  } catch {
+    /* the ledger is best effort: a read-only HOME must not break chat */
+  }
+}
+
+const slots = new Map() // account key → [{ releasedAt }]
+
+/**
+ * Book a slot for a streaming request, waiting at most `waitMs`.
+ * Returns the slot, or null when the wait budget ran out (the caller then
+ * falls back to a non-streaming call, which needs no slot).
+ */
+async function takeSlot(key, signal, { holdMs = SESSION_HOLD_MS, waitMs = SESSION_WAIT_MS } = {}) {
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    const now = Date.now()
+    // Merge the process-local view with what other processes booked.
+    const mine = (slots.get(key) ?? []).filter((s) => s.releasedAt > now)
+    const stored = Array.isArray(readSlotFile()[key]) ? readSlotFile()[key] : []
+    const seen = new Set(mine.map((s) => `${s.releasedAt}`))
+    const held = [...mine, ...stored.filter((s) => s.releasedAt > now && !seen.has(`${s.releasedAt}`))]
+    slots.set(key, held)
+    if (held.length < SESSION_SLOTS) {
+      const slot = { releasedAt: now + holdMs }
+      held.push(slot)
+      const state = readSlotFile()
+      state[key] = held
+      writeSlotFile(state)
+      return slot
+    }
+    const soonest = held.reduce((a, b) => (a.releasedAt <= b.releasedAt ? a : b))
+    const wait = Math.max(0, soonest.releasedAt - now) + SESSION_SLOT_MARGIN_MS
+    if (initAborted(signal)) throw abortError()
+    // Wait for the soonest release unless that is beyond the budget.
+    if (now + (soonest.releasedAt - now) > deadline) return null
+    await delay(wait, signal)
+  }
+}
+
+/** Give a slot back once its request finished; the gateway still holds it. */
+function releaseSlot(slot, key) {
+  if (!slot) return
+  slot.releasedAt = Math.min(slot.releasedAt, Date.now() + SESSION_HOLD_MS)
+  if (!key) return
+  const now = Date.now()
+  const state = readSlotFile()
+  const mine = slots.get(key) ?? []
+  const merged = [...mine, ...(Array.isArray(state[key]) ? state[key] : [])]
+  const seen = new Set()
+  state[key] = merged
+    .filter((s) => s.releasedAt > now)
+    .filter((s) => {
+      const k = `${s.releasedAt}`
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+  writeSlotFile(state)
+}
+
 /** Copy a response with `text` as its body, dropping stale length/encoding headers. */
 function textResponse(res, text) {
   const headers = new Headers(res.headers)
@@ -655,29 +789,77 @@ function textResponse(res, text) {
 }
 
 /**
+ * Re-shape a plain chat.completion into a one-shot SSE body, so a caller that
+ * asked for `stream: true` but had to be served by a non-streaming call still
+ * parses it (one `chat.completion.chunk` with the whole answer, then [DONE]).
+ */
+async function asSseChunks(res) {
+  const text = await res.text()
+  const json = safeJson(text)
+  const headers = new Headers(res.headers)
+  for (const h of ["content-length", "content-encoding", "transfer-encoding"]) headers.delete(h)
+  headers.set("content-type", "text/event-stream; charset=utf-8")
+  headers.set("cache-control", "no-cache")
+  if (!json?.choices) return new Response(text, { status: res.status, statusText: res.statusText, headers })
+  const chunk = {
+    id: json.id,
+    object: "chat.completion.chunk",
+    created: json.created ?? Math.floor(Date.now() / 1000),
+    model: json.model,
+    choices: json.choices.map((c, i) => ({
+      index: c.index ?? i,
+      delta: { role: "assistant", content: c.message?.content ?? "" },
+      finish_reason: c.finish_reason ?? "stop",
+    })),
+    ...(json.usage ? { usage: json.usage } : {}),
+  }
+  const body = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
+/**
  * The plugin's per-request fetch: sign the outgoing chat request with the
- * account's temporary credentials, then send it. A 400 that reports the
- * upstream concurrent-session limit (TM.00001041) is retried with exponential
- * backoff — the slots free up on their own — and every retry is re-signed so
- * the `x-sdk-date` stamp stays current. `context.retryDelays` overrides the
- * backoff schedule (tests).
+ * account's temporary credentials, then send it.
+ *
+ * A streaming request first takes one of the account's 3 streaming slots (the
+ * gateway holds a finished streaming session ~60 s; a non-streaming request
+ * needs none). A TM.00001041 that still leaks through — another client on the
+ * same account holds the slots — is retried with backoff, and every retry is
+ * re-signed so `x-sdk-date` stays current. `context.retryDelays` overrides the
+ * backoff schedule and `context.slotHoldMs` the slot hold (tests).
  */
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
   const url = req ? req.url : String(input)
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const baseHeaders = new Headers(init?.headers ?? req?.headers)
-  let body
-  if (init?.body != null) body = await toBytes(init.body)
-  else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
-  else body = new Uint8Array()
-  const model = typeof init?.body === "string" ? safeJson(init.body)?.model : undefined
+  let rawBody
+  if (init?.body != null) rawBody = await toBytes(init.body)
+  else if (req) rawBody = new Uint8Array(await req.clone().arrayBuffer())
+  else rawBody = new Uint8Array()
+  const raw = typeof init?.body === "string" ? safeJson(init.body) : null
+  // The host hands the request down with the provider prefix on the model id
+  // (`codearts/deepseek-v4.1-flash`), which the gateway does not know: it
+  // answers InferHub.002002009.404 "model is not registered" (in an SSE frame
+  // when streaming, so it looks like a successful reply). Strip it.
+  let body = rawBody
+  if (raw && typeof raw.model === "string" && raw.model.startsWith(`${PROVIDER}/`)) {
+    raw.model = raw.model.slice(PROVIDER.length + 1)
+    body = utf8(JSON.stringify(raw))
+  }
+  const model = raw?.model
+  const streaming = raw?.stream === true
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
+  // A streaming request that cannot get a slot in time is sent as a plain
+  // (non-streaming) call instead: same answer, no slot, no wait.
+  let asStream = streaming
 
   const send = async () => {
+    // Only the downgraded path rewrites the body; everything else sends it as built.
+    const payload = streaming && !asStream ? utf8(JSON.stringify({ ...raw, stream: false })) : body
     const signed = await signRequestHuawei(
       cred.access_key_id, cred.secret_access_key, cred.security_token,
-      method, url, body, extra,
+      method, url, payload, extra,
     )
     const headers = new Headers(baseHeaders)
     signed.forEach((value, key) => {
@@ -690,26 +872,90 @@ async function signedFetch(cred, input, init, context) {
       ...init,
       method,
       headers,
-      ...(body.length > 0 ? { body } : {}),
+      ...(payload.length > 0 ? { body: payload } : {}),
     })
   }
 
   const delays = context.retryDelays ?? SESSION_RETRY_DELAYS_MS
-  let res = await send()
-  for (let attempt = 0; res.status === 400 && attempt < delays.length; attempt++) {
-    if (init?.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError")
-    const text = await res.text()
-    if (!text.includes(SESSION_LIMIT_ERROR)) return textResponse(res, text)
-    await sleepWithJitter(delays[attempt])
+  const slotKey = context.slotKey ?? cred.access_key_id
+  let slot = null
+  if (streaming) {
+    slot = await takeSlot(slotKey, init?.signal, {
+      holdMs: context.slotHoldMs,
+      waitMs: context.slotWaitMs,
+    })
+    // No slot in the budget: plain call, then hand it back as SSE.
+    if (!slot) {
+      if (init?.signal?.aborted) throw abortError()
+      asStream = false
+    }
+  }
+  let res
+  try {
     res = await send()
+    for (let attempt = 0; res.status === 400 && attempt < delays.length; attempt++) {
+      if (init?.signal?.aborted) throw abortError()
+      const text = await res.text()
+      if (!text.includes(SESSION_LIMIT_ERROR)) {
+        // An expired security token (APIG.0602) is the same story as a 401:
+        // the credential in this process went stale. Mark it expired so the
+        // loader's self-heal refreshes and retries.
+        const rebuilt = textResponse(res, text)
+        if (text.includes(STALE_TOKEN_ERROR)) {
+          const h = new Headers(rebuilt.headers)
+          h.set("X-Magpie-Sign-In", "expired")
+          return new Response(text, { status: rebuilt.status, statusText: rebuilt.statusText, headers: h })
+        }
+        return rebuilt
+      }
+      await sleepWithJitter(delays[attempt])
+      res = await send()
+    }
+  } catch (e) {
+    releaseSlot(slot, slotKey)
+    throw e
   }
   // A 401/403 is the sign-in gone; magpie marks the account from here.
   if (res.status === 401 || res.status === 403) {
+    releaseSlot(slot, slotKey)
     const h = new Headers(res.headers)
     h.set("X-Magpie-Sign-In", "expired")
     return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
   }
-  return res
+  // Downgraded call: wrap the whole answer in one chat.completion.chunk so a
+  // streaming caller still reads a well-formed SSE body.
+  if (streaming && !asStream && res.ok) {
+    releaseSlot(slot, slotKey)
+    return asSseChunks(res)
+  }
+  // The slot stays booked until the upstream ends the reply: the gateway keeps
+  // counting the session until then, so a body nobody drains would hold it too.
+  if (!slot || !res.body) {
+    releaseSlot(slot, slotKey)
+    return res
+  }
+  const reader = res.body.getReader()
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          releaseSlot(slot, slotKey)
+          controller.close()
+        } else {
+          controller.enqueue(value)
+        }
+      } catch (e) {
+        releaseSlot(slot, slotKey)
+        controller.error(e)
+      }
+    },
+    cancel(reason) {
+      releaseSlot(slot, slotKey)
+      return reader.cancel(reason).catch(() => {})
+    },
+  })
+  return new Response(stream, { status: res.status, statusText: res.statusText, headers: res.headers })
 }
 
 /** A signed GET returning the response text, or undefined on any failure. */
@@ -979,7 +1225,11 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             // that is what an expired/rotated temporary credential looks like.
             // Force one refresh and retry before reporting the response, so a
             // missed scheduled refresh does not brick the account.
-            if (res.status === 401 && Date.now() - refreshFailedAt > REFRESH_RETRY_COOLDOWN_MS) {
+            // A 401, or a 400 flagged X-Magpie-Sign-In: expired (APIG.0602
+            // security token gone), means this process held a stale
+            // credential: refresh once and retry before reporting it.
+            const stale = res.status === 401 || new Headers(res.headers).get("X-Magpie-Sign-In") === "expired"
+            if (stale && Date.now() - refreshFailedAt > REFRESH_RETRY_COOLDOWN_MS) {
               const next = await refreshNow()
               if (next) res = await signedFetch(next, input, init, { ...ctx, ...(await idsFor(next)) })
             }

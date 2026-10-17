@@ -5,6 +5,13 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+// The streaming-slot ledger is a file so every process shares it; keep the
+// tests off the real one.
+process.env.MAGPIE_CODEARTS_SLOT_FILE = join(mkdtempSync(join(tmpdir(), "codearts-slots-")), "slots.json")
 
 import { CodeArtsAuthPlugin, _internal as x } from "./index.mjs"
 
@@ -471,6 +478,150 @@ test("signedFetch aborts between session-limit retries", async () => {
   }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [50] })
   controller.abort()
   await assert.rejects(attempt, { name: "AbortError" })
+})
+
+test("the provider prefix is stripped from the model id before signing", async () => {
+  const cred = await makeCred()
+  let sent = ""
+  const fetcher = async (url, init) => {
+    sent = new TextDecoder().decode(init.body ?? new Uint8Array())
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], stream: true }),
+  })
+  const parsed = JSON.parse(sent)
+  assert.equal(parsed.model, "deepseek-v4.1-flash")
+  assert.equal(parsed.stream, true)
+})
+
+// ---- streaming-slot ledger ---------------------------------------------------
+
+test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {
+  // The gateway allows 3 concurrent streaming sessions per account and holds a
+  // finished one ~60 s; a 4th is refused with TM.00001041. Four streaming calls
+  // must therefore arrive spaced out, while a non-streaming call never waits.
+  const cred = await makeCred()
+  const arrivals = []
+  const fetcher = async (url, init) => {
+    const sent = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body ?? new Uint8Array())
+    arrivals.push({ at: Date.now(), stream: JSON.parse(sent || "{}").stream === true })
+    return new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 120 }
+  const body = (stream, key) => JSON.stringify({ model: "deepseek-v4.1-flash", stream, messages: [{ role: "user", content: key }] })
+  const slots = [
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "a") }, { ...ctx, slotKey: "acct-1" }),
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "b") }, { ...ctx, slotKey: "acct-1" }),
+    x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "c") }, { ...ctx, slotKey: "acct-1" }),
+  ]
+  for (const r of await Promise.all([...slots])) await r.text()
+  // The first three went out together; the ledger is now full.
+  assert.equal(arrivals.length, 3)
+  const started = Date.now()
+  const fourth = await x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(true, "d") }, { ...ctx, slotKey: "acct-1" })
+  await fourth.text()
+  assert.ok(Date.now() - started >= 100, "the 4th streaming request must wait for a slot")
+  assert.equal(arrivals.length, 4)
+
+  // A non-streaming request never takes a slot and never waits.
+  const t = Date.now()
+  const plain = await x.signedFetch(cred, CHAT_URL, { method: "POST", body: body(false, "e") }, { ...ctx, slotKey: "acct-1" })
+  await plain.text()
+  assert.ok(Date.now() - t < 100, "non-streaming requests must not queue")
+})
+
+test("a streaming slot is freed when the body is fully read", async () => {
+  const cred = await makeCred()
+  let calls = 0
+  const fetcher = async () => {
+    calls++
+    return new Response("data: {}\n\n", { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  // A hold of 5 s would make the second call wait if the slot were not released.
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 5_000, slotKey: "acct-2" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  for (let i = 0; i < 4; i++) {
+    const res = await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)
+    assert.equal(await res.text(), "data: {}\n\n")
+  }
+  assert.equal(calls, 4)
+  // Reset the ledger so other tests are unaffected.
+  await new Promise((r) => setTimeout(r, 10))
+})
+
+test("a streaming request with no slot in budget degrades to a one-shot SSE answer", async () => {
+  const cred = await makeCred()
+  const bodies = []
+  const fetcher = async (url, init) => {
+    const sent = typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body ?? new Uint8Array())
+    bodies.push(JSON.parse(sent))
+    return new Response(JSON.stringify({
+      id: "chatcmpl-x", object: "chat.completion", model: "deepseek-v4.1-flash",
+      choices: [{ index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" }],
+    }), { status: 200, headers: { "content-type": "application/json" } })
+  }
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 60_000, slotWaitMs: 30, slotKey: "acct-degrade" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  // Fill all three slots.
+  for (let i = 0; i < 3; i++) await (await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)).text()
+  // The next streaming call cannot get a slot: it goes out non-streaming and
+  // comes back as SSE with the whole answer in one chunk.
+  const res = await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)
+  assert.equal(res.status, 200)
+  assert.match(new Headers(res.headers).get("content-type"), /text\/event-stream/)
+  const sse = await res.text()
+  assert.match(sse, /data: \{.*"object":"chat.completion.chunk".*\}\n\n/)
+  assert.ok(sse.trimEnd().endsWith("data: [DONE]"))
+  assert.equal(bodies.at(-1).stream, false, "the degraded call must not ask for a stream")
+})
+
+test("an aborted wait for a slot rejects", async () => {
+  const cred = await makeCred()
+  const fetcher = async () => new Response("data: {}\n\n", { status: 200 })
+  const ctx = { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotHoldMs: 60_000, slotWaitMs: 60_000, slotKey: "acct-abort" }
+  const body = JSON.stringify({ model: "deepseek-v4.1-flash", stream: true })
+  for (let i = 0; i < 3; i++) await (await x.signedFetch(cred, CHAT_URL, { method: "POST", body }, ctx)).text()
+  const controller = new AbortController()
+  const attempt = x.signedFetch(cred, CHAT_URL, { method: "POST", body, signal: controller.signal }, ctx)
+  setTimeout(() => controller.abort(), 20)
+  await assert.rejects(attempt, { name: "AbortError" })
+})
+
+test("loader refreshes and retries when the security token has expired (APIG.0602)", async () => {
+  const cred = await makeCred()
+  let chats = 0
+  let stsCalls = 0
+  const authz = []
+  const fetcher = async (url, init) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      authz.push(new Headers(init.headers).get("authorization"))
+      if (chats === 1) {
+        return new Response(JSON.stringify({
+          error_msg: "Bad request: the security token has expired", error_code: "APIG.0602",
+        }), { status: 400 })
+      }
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2, "the stale-token call must be retried once")
+  assert.equal(stsCalls, 1)
+  assert.match(authz[1], /^SDK-HMAC-SHA256 Access=AK2,/)
 })
 
 // ---- 401 self-heal ----------------------------------------------------------
