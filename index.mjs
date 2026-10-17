@@ -801,6 +801,42 @@ function releaseSlot(slot, key) {
   writeSlotFile(state)
 }
 
+/**
+ * Some replies come back with the whole answer in `delta.reasoning_content`
+ * and `delta.content` left empty — a caller that only reads `content` shows
+ * an empty answer for an HTTP 200. Fold the reasoning text into `content`
+ * (keeping reasoning_content as it was, so a caller that reads it is not
+ * surprised either).
+ */
+function foldReasoningIntoContent(frame) {
+  const choice = frame?.choices?.[0]
+  const delta = choice?.delta
+  if (!delta || typeof delta !== "object") return frame
+  const content = typeof delta.content === "string" ? delta.content : ""
+  const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : ""
+  if (content || !reasoning) return frame
+  return { ...frame, choices: [{ ...choice, delta: { ...delta, content: reasoning } }, ...(frame.choices ?? []).slice(1)] }
+}
+
+/** Rewrite `data:` frames of an SSE body, leaving every other line alone. */
+function rewriteSseChunk(text) {
+  if (!text.includes("reasoning_content")) return text
+  return text
+    .split("\n")
+    .map((line) => {
+      const m = /^(data:\s*)(\{.*\})$/.exec(line)
+      if (!m) return line
+      try {
+        const parsed = JSON.parse(m[2])
+        const folded = foldReasoningIntoContent(parsed)
+        return folded === parsed ? line : m[1] + JSON.stringify(folded)
+      } catch {
+        return line
+      }
+    })
+    .join("\n")
+}
+
 /** Copy a response with `text` as its body, dropping stale length/encoding headers. */
 function textResponse(res, text) {
   const headers = new Headers(res.headers)
@@ -828,7 +864,8 @@ async function asSseChunks(res) {
     model: json.model,
     choices: json.choices.map((c, i) => ({
       index: c.index ?? i,
-      delta: { role: "assistant", content: c.message?.content ?? "" },
+      // Same reasoning-instead-of-content quirk as the streaming path.
+      delta: { role: "assistant", content: c.message?.content || c.message?.reasoning_content || "" },
       finish_reason: c.finish_reason ?? "stop",
     })),
     ...(json.usage ? { usage: json.usage } : {}),
@@ -955,16 +992,28 @@ async function signedFetch(cred, input, init, context) {
     return res
   }
   const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  // SSE frames can split across chunks: hold the trailing partial line back.
+  let pending = ""
   const stream = new ReadableStream({
     async pull(controller) {
       try {
         const { done, value } = await reader.read()
         if (done) {
           releaseSlot(slot, slotKey)
+          if (pending) controller.enqueue(encoder.encode(rewriteSseChunk(pending)))
           controller.close()
-        } else {
-          controller.enqueue(value)
+          return
         }
+        const text = pending + decoder.decode(value, { stream: true })
+        const cut = text.lastIndexOf("\n")
+        if (cut < 0) {
+          pending = text
+          return
+        }
+        pending = text.slice(cut + 1)
+        controller.enqueue(encoder.encode(rewriteSseChunk(text.slice(0, cut + 1))))
       } catch (e) {
         releaseSlot(slot, slotKey)
         controller.error(e)
@@ -1343,6 +1392,7 @@ export const _internal = {
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential, accountIdentityOf,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
+  foldReasoningIntoContent, rewriteSseChunk,
   sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
   SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS,
 }

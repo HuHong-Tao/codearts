@@ -513,6 +513,27 @@ test("accountIdentityOf reads the signer out of the refresh token profile", () =
   assert.equal(x.accountIdentityOf({ refresh_token: "a.b.c" }), "")
 })
 
+test("reasoning-only deltas are folded into content", () => {
+  const frame = { choices: [{ index: 0, delta: { role: "assistant", content: null, reasoning_content: "answer" } }] }
+  const out = x.foldReasoningIntoContent(frame)
+  assert.equal(out.choices[0].delta.content, "answer")
+  assert.equal(out.choices[0].delta.reasoning_content, "answer")
+  // A frame that already has content is left untouched.
+  const ok = { choices: [{ index: 0, delta: { content: "hi", reasoning_content: "r" } }] }
+  assert.equal(x.foldReasoningIntoContent(ok), ok)
+})
+
+test("rewriteSseChunk rewrites reasoning-only frames and keeps the framing", () => {
+  const input = 'data:{"choices":[{"index":0,"delta":{"content":null,"reasoning_content":"hello"}}]}\n\n'
+  const out = x.rewriteSseChunk(input)
+  assert.ok(out.startsWith("data:"))
+  assert.ok(out.endsWith("\n\n"))
+  const payload = JSON.parse(out.trim().slice(5))
+  assert.equal(payload.choices[0].delta.content, "hello")
+  // Non-frame lines pass through untouched.
+  assert.equal(x.rewriteSseChunk("data: [DONE]\n\n"), "data: [DONE]\n\n")
+})
+
 // ---- streaming-slot ledger ---------------------------------------------------
 
 test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {
