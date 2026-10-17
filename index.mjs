@@ -126,6 +126,13 @@ const STALE_TOKEN_ERROR = "APIG.0602"
 // tokens must be between 0 and 65536). Declaring no limit made callers pass
 // their own default, which is over it.
 const MAX_OUTPUT_TOKENS = 65_536
+// Thinking must be asked for EXPLICITLY: left to the default, the gateway
+// streams the model's reasoning inside `content` itself, so a caller shows the
+// thinking as the answer. With `thinking: { type: "enabled" }` the reasoning
+// goes to `reasoning_content` and `content` carries only the reply (measured:
+// default -> content and reasoning both "我们需要回答…"; enabled -> content
+// "1+1等于2。", reasoning kept apart).
+const ENABLE_THINKING = { type: "enabled" }
 const SESSION_SLOTS = 3
 // How long the gateway keeps a finished streaming session occupied.
 const SESSION_HOLD_MS = 60_000
@@ -805,42 +812,6 @@ function releaseSlot(slot, key) {
   writeSlotFile(state)
 }
 
-/**
- * Some replies come back with the whole answer in `delta.reasoning_content`
- * and `delta.content` left empty — a caller that only reads `content` shows
- * an empty answer for an HTTP 200. Fold the reasoning text into `content`
- * (keeping reasoning_content as it was, so a caller that reads it is not
- * surprised either).
- */
-function foldReasoningIntoContent(frame) {
-  const choice = frame?.choices?.[0]
-  const delta = choice?.delta
-  if (!delta || typeof delta !== "object") return frame
-  const content = typeof delta.content === "string" ? delta.content : ""
-  const reasoning = typeof delta.reasoning_content === "string" ? delta.reasoning_content : ""
-  if (content || !reasoning) return frame
-  return { ...frame, choices: [{ ...choice, delta: { ...delta, content: reasoning } }, ...(frame.choices ?? []).slice(1)] }
-}
-
-/** Rewrite `data:` frames of an SSE body, leaving every other line alone. */
-function rewriteSseChunk(text) {
-  if (!text.includes("reasoning_content")) return text
-  return text
-    .split("\n")
-    .map((line) => {
-      const m = /^(data:\s*)(\{.*\})$/.exec(line)
-      if (!m) return line
-      try {
-        const parsed = JSON.parse(m[2])
-        const folded = foldReasoningIntoContent(parsed)
-        return folded === parsed ? line : m[1] + JSON.stringify(folded)
-      } catch {
-        return line
-      }
-    })
-    .join("\n")
-}
-
 /** Copy a response with `text` as its body, dropping stale length/encoding headers. */
 function textResponse(res, text) {
   const headers = new Headers(res.headers)
@@ -906,6 +877,12 @@ async function signedFetch(cred, input, init, context) {
   let body = rawBody
   if (raw && typeof raw.model === "string" && raw.model.startsWith(`${PROVIDER}/`)) {
     raw.model = raw.model.slice(PROVIDER.length + 1)
+    body = utf8(JSON.stringify(raw))
+  }
+  // Ask for the answer, not the thinking — chat only, so introspection and
+  // non-chat bodies keep whatever shape they had.
+  if (raw && Array.isArray(raw.messages)) {
+    if (raw.thinking === undefined) raw.thinking = ENABLE_THINKING
     body = utf8(JSON.stringify(raw))
   }
   // Keep the output budget inside what the gateway accepts, whatever default
@@ -1008,40 +985,16 @@ async function signedFetch(cred, input, init, context) {
     return res
   }
   const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  const encoder = new TextEncoder()
-  // SSE frames can split across chunks: hold the trailing partial line back.
-  // Pass frames through untouched unless one carries reasoning-only content;
-  // only then buffer a partial line so the JSON can be rebuilt.
-  let pending = ""
   const stream = new ReadableStream({
     async pull(controller) {
       try {
         const { done, value } = await reader.read()
         if (done) {
           releaseSlot(slot, slotKey)
-          if (pending) {
-            controller.enqueue(encoder.encode(rewriteSseChunk(pending)))
-            pending = ""
-          }
           controller.close()
           return
         }
-        const text = pending + decoder.decode(value, { stream: true })
-        if (!text.includes("reasoning_content")) {
-          // Nothing to fold: forward the bytes as they arrived.
-          pending = ""
-          controller.enqueue(encoder.encode(text))
-          return
-        }
-        const cut = text.lastIndexOf("\n")
-        if (cut < 0) {
-          pending = text
-          controller.enqueue(new Uint8Array()) // keep pull() flowing
-          return
-        }
-        pending = text.slice(cut + 1)
-        controller.enqueue(encoder.encode(rewriteSseChunk(text.slice(0, cut + 1))))
+        controller.enqueue(value)
       } catch (e) {
         releaseSlot(slot, slotKey)
         controller.error(e)
@@ -1420,7 +1373,6 @@ export const _internal = {
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential, accountIdentityOf,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
-  foldReasoningIntoContent, rewriteSseChunk,
   sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
   SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS, MAX_OUTPUT_TOKENS,
 }

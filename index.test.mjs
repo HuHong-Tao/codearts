@@ -315,7 +315,8 @@ test("loader signs each chat request with SDK-HMAC-SHA256", async () => {
   assert.ok(headers.get("session-id"))
   assert.equal(headers.has("maas_type"), false)
   // The signed body must be forwarded verbatim.
-  assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [] }))
+  const forwarded = JSON.parse(new TextDecoder().decode(seen[0].init.body))
+  assert.deepEqual(forwarded, { model: "GLM-5.2", messages: [], thinking: { type: "enabled" } })
 })
 
 test("loader adds a signed maas_type header for benefit models", async () => {
@@ -513,27 +514,6 @@ test("accountIdentityOf reads the signer out of the refresh token profile", () =
   assert.equal(x.accountIdentityOf({ refresh_token: "a.b.c" }), "")
 })
 
-test("reasoning-only deltas are folded into content", () => {
-  const frame = { choices: [{ index: 0, delta: { role: "assistant", content: null, reasoning_content: "answer" } }] }
-  const out = x.foldReasoningIntoContent(frame)
-  assert.equal(out.choices[0].delta.content, "answer")
-  assert.equal(out.choices[0].delta.reasoning_content, "answer")
-  // A frame that already has content is left untouched.
-  const ok = { choices: [{ index: 0, delta: { content: "hi", reasoning_content: "r" } }] }
-  assert.equal(x.foldReasoningIntoContent(ok), ok)
-})
-
-test("rewriteSseChunk rewrites reasoning-only frames and keeps the framing", () => {
-  const input = 'data:{"choices":[{"index":0,"delta":{"content":null,"reasoning_content":"hello"}}]}\n\n'
-  const out = x.rewriteSseChunk(input)
-  assert.ok(out.startsWith("data:"))
-  assert.ok(out.endsWith("\n\n"))
-  const payload = JSON.parse(out.trim().slice(5))
-  assert.equal(payload.choices[0].delta.content, "hello")
-  // Non-frame lines pass through untouched.
-  assert.equal(x.rewriteSseChunk("data: [DONE]\n\n"), "data: [DONE]\n\n")
-})
-
 test("the output budget is clamped to what the gateway accepts", async () => {
   const cred = await makeCred()
   const sent = []
@@ -566,8 +546,32 @@ test("model limits declare a usable output budget", async () => {
   assert.equal(m.limit.output, x.MAX_OUTPUT_TOKENS)
 })
 
-// ---- streaming-slot ledger ---------------------------------------------------
+test("chat requests ask for thinking explicitly so it stays out of content", async () => {
+  const cred = await makeCred()
+  const sent = []
+  const fetcher = async (url, init) => {
+    sent.push(JSON.parse(new TextDecoder().decode(init.body ?? new Uint8Array())))
+    return new Response('{"ok":true}', { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  })
+  // Left to its default the gateway streams the reasoning as content; asking
+  // for it explicitly routes it to reasoning_content instead.
+  assert.deepEqual(sent[0].thinking, { type: "enabled" })
 
+  // A caller's own choice wins.
+  await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "codearts/deepseek-v4.1-flash", messages: [], thinking: { type: "disabled" } }),
+  })
+  assert.deepEqual(sent[1].thinking, { type: "disabled" })
+})
 test("streaming requests wait for a free slot instead of hitting the 3-session cap", async () => {
   // The gateway allows 3 concurrent streaming sessions per account and holds a
   // finished one ~60 s; a 4th is refused with TM.00001041. Four streaming calls
