@@ -366,6 +366,48 @@ test("loader reuses one Chat-Id across requests instead of opening a session per
   assert.equal(seen[0], seen[2])
 })
 
+test("session ids are derived from the account, shared across loaders, unique per account", async () => {
+  const cred = await makeCred()
+  const idsOf = async (c) => await x.sessionIdsFor(c)
+  const a1 = await idsOf(cred)
+  const a2 = await idsOf(cred)
+  // Deterministic: two loaders (processes) on the same account share one session.
+  assert.equal(a1.chatId, a2.chatId)
+  assert.equal(a1.sessionId, a2.sessionId)
+  assert.match(a1.chatId, /^[0-9a-f]{32}$/)
+  assert.match(a1.sessionId, /^[0-9a-f]{32}$/)
+  // A different account (rotated AK) gets its own session.
+  const other = await idsOf({ access_key_id: "AK-other" })
+  assert.notEqual(other.chatId, a1.chatId)
+  assert.notEqual(other.sessionId, a1.sessionId)
+})
+
+test("a fresh loader (new process) sends the same session headers for the same account", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push({
+      chat: new Headers(init.headers).get("chat-id"),
+      session: new Headers(init.headers).get("session-id"),
+    })
+    return new Response("ok", { status: 200 })
+  }
+  const make = async () => {
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+    return plugin.auth.loader(async () => makeAuth(cred))
+  }
+  const init = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  }
+  await (await make()).fetch(CHAT_URL, init)
+  await (await make()).fetch(CHAT_URL, init)
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].chat, seen[1].chat, "two processes on one account must share the session")
+  assert.equal(seen[0].session, seen[1].session)
+})
+
 test("signedFetch retries the session-limit error with backoff and succeeds", async () => {
   const cred = await makeCred()
   let sends = 0

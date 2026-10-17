@@ -54,10 +54,11 @@ magpie plugin add ./index.mjs
 ## 说明与已知限制
 
 -   **会话管理**：上游按 `Chat-Id` 计并发会话（每账号上限 3 个，会话在响应完成后
-    还会存活一段时间）。插件整个会话期复用**一个** `Chat-Id`，自身永远只占一个槽位；
-    同账号其它端（如官方客户端）占满槽位时，对 `TM.00001041`（并发会话数已达上限）
-    做指数退避重试后再报错。因此密集调用（agent 一条消息一串请求）不会再把
-    对话打死。
+    还会存活一段时间）。插件的 `Chat-Id` / `Session-Id` 从账号凭据**派生**——同一账号的
+    所有进程、所有设备共享同一个上游会话，无论调用多密集都只占一个槽位
+    （已实测同一会话上 4 路并发互不串扰）；同账号其它端（如官方客户端）占满槽位时，
+    对 `TM.00001041`（并发会话数已达上限）做带抖动的退避重试后再报错。因此密集调用
+    （agent 一条消息一串请求）不会再把对话打死。
 -   **凭据自愈**：`401`（IAM `APIG.0301 verify ak sk signature fail`，即临时凭据
     过期或被轮换）会自动强制续期并重试一次，续期救不回来才把账号标记为需要
     重新登录。
@@ -109,10 +110,12 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
 ### Notes
 
 - **Sessions**: the gateway counts concurrent sessions per `Chat-Id` (max 3 per
-  account, and a finished session keeps its slot briefly). The plugin reuses one
-  `Chat-Id` for its whole session, so rapid agent bursts no longer exhaust the
-  limit; if other devices on the account hold the slots, `TM.00001041` is retried
-  with exponential backoff before surfacing.
+  account, and a finished session keeps its slot briefly). The plugin derives
+  its `Chat-Id`/`Session-Id` from the account credential, so every process and
+  device on the same account shares one upstream session — rapid agent bursts
+  never exhaust the limit (verified: 4-way concurrency on one session, no
+  cross-talk); if other clients hold the slots, `TM.00001041` is retried with
+  jittered backoff before surfacing.
 - **Self-heal**: a `401` signature rejection (stale/rotated temporary credential)
   forces one credential refresh + retry before the account is marked as needing
   a new sign-in.

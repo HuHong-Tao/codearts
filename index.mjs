@@ -29,11 +29,12 @@
 //   5. Every model request is signed with SDK-HMAC-SHA256 in the loader's
 //      `fetch`, and the account's live model list + quota are read from
 //      signed GETs.
-//   6. The loader keeps ONE `Chat-Id` per account session: the gateway caps an
-//      account at 3 concurrent sessions keyed by that header, so reusing it
-//      keeps the plugin to a single slot. The session-limit error
-//      (TM.00001041) is retried with exponential backoff, and a 401 signature
-//      rejection triggers one forced credential refresh + retry.
+//   6. The session headers (`Chat-Id` / `Session-Id`) are derived from the
+//      account's credential, so every process and device running the same
+//      account shares ONE upstream session: the gateway caps an account at 3
+//      concurrent sessions keyed by `Chat-Id`. The session-limit error
+//      (TM.00001041) is retried with backoff, and a 401 signature rejection
+//      triggers one forced credential refresh + retry.
 //
 // It imitates @magpie-community/opencode-workbuddy-auth for structure but
 // replaces its browser sign-in + bearer-token requests with CodeArts' OAuth +
@@ -99,13 +100,17 @@ let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
 
 // The gateway counts every distinct `Chat-Id` as a concurrent session and caps
 // an account at 3; a finished session keeps its slot for a while after the
-// response. Opening a session per request therefore pinned the counter and
-// every further chat died with HTTP 400 TM.00001041 ("并发会话数已达上限(3个)").
-// The plugin now keeps one `Chat-Id` per loader (the gateway reuses the
-// session), and — for the slots other clients on the same account hold —
-// retries this error with exponential backoff before giving up.
+// response. Opening a session per request (or even per process) therefore
+// pinned the counter and every further chat died with HTTP 400 TM.00001041
+// ("并发会话数已达上限(3个)"). The plugin derives both session headers from the
+// account, so every process and every device running the same account shares
+// ONE upstream session whatever the call frequency, and — for the slots other
+// clients on the same account hold — retries this error with backoff before
+// giving up.
 const SESSION_LIMIT_ERROR = "TM.00001041"
-const SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]
+// Even polling rather than a long-tail exponential curve: slots free on their
+// own within a minute or so, and a client deadline should catch a poll.
+const SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 6_000, 8_000, 10_000, 12_000, 15_000]
 
 // Context windows (in tokens), keyed by the exact chat model id. Models
 // without an entry leave the window to the backend's default.
@@ -626,6 +631,17 @@ function rememberBenefitIds(ids) {
   for (const id of ids) if (!benefitModelIds.includes(id)) benefitModelIds.push(id)
 }
 
+/**
+ * Derive the upstream session headers from the account's credential: every
+ * process (and device) running the same account shares one session slot, so
+ * the 3-session cap is never spent on plugin-internal churn. The ids change
+ * only when STS rotates the credential. 32 hex chars each, like randomHex(16).
+ */
+async function sessionIdsFor(cred) {
+  const digest = await sha256Hex(utf8(`codearts:${cred.access_key_id}`))
+  return { chatId: digest.slice(0, 32), sessionId: digest.slice(32, 64) }
+}
+
 /** Wait `ms` (±25% jitter so concurrent callers do not sync up). */
 function sleepWithJitter(ms) {
   return new Promise((r) => setTimeout(r, Math.round(ms * (0.75 + Math.random() * 0.5))))
@@ -944,24 +960,28 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           return (await refreshNow()) ?? cred
         }
 
-        // One session per loader: the gateway keys a session by `Chat-Id` and
-        // caps an account at 3 concurrent ones, so a per-request id piled up
-        // dead sessions until every chat was rejected (TM.00001041). Reusing
-        // one id per account keeps the plugin at a single slot, whatever the
-        // call frequency (the fetch below retries the residual error).
-        const context = { sessionId: randomHex(16), chatId: randomHex(16), fetcher }
+        // One session per ACCOUNT, not per request or per process: the gateway
+        // keys a session by `Chat-Id` and caps an account at 3 concurrent
+        // ones, so per-request ids piled up dead sessions until every chat was
+        // rejected (TM.00001041). The ids are derived from the credential, so
+        // every process and every device running the same account share a
+        // single upstream session (concurrent requests on one session are
+        // fine); they only change when the STS credential rotates.
+        const context = { fetcher }
+        const idsFor = (c) => sessionIdsFor(c)
         return {
           baseURL: CHAT_API_BASE,
           async fetch(input, init = {}) {
             const c = await current()
-            let res = await signedFetch(c, input, init, context)
+            const ctx = { ...context, ...(await idsFor(c)) }
+            let res = await signedFetch(c, input, init, ctx)
             // A 401 here means the gateway rejected the signature — with IAM
             // that is what an expired/rotated temporary credential looks like.
             // Force one refresh and retry before reporting the response, so a
             // missed scheduled refresh does not brick the account.
             if (res.status === 401 && Date.now() - refreshFailedAt > REFRESH_RETRY_COOLDOWN_MS) {
               const next = await refreshNow()
-              if (next) res = await signedFetch(next, input, init, context)
+              if (next) res = await signedFetch(next, input, init, { ...ctx, ...(await idsFor(next)) })
             }
             return res
           },
@@ -1053,6 +1073,6 @@ export const _internal = {
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
-  parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
+  sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
   SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS,
 }
