@@ -836,6 +836,27 @@ test("auth.usage reports the plan's credit window", async () => {
   ])
 })
 
+test("an exhausted quota reported inside a 200 becomes a real error", async () => {
+  const cred = await makeCred()
+  const frame = `data:${JSON.stringify({ error_code: x.QUOTA_ERROR, error_msg: "insufficient quota" })}\n\n`
+  const fetcher = async () => new Response(frame, { status: 200, headers: { "content-type": "text/event-stream" } })
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v4.1-flash", stream: true }),
+  }, { chatId: "c", sessionId: "s", fetcher, retryDelays: [], slotKey: "acct-quota", slotHoldMs: 1000 })
+  // A caller must not see "200 with no answer": say what happened.
+  assert.equal(res.status, 402)
+  const body = JSON.parse(await res.text())
+  assert.equal(body.error.code, x.QUOTA_ERROR)
+  assert.match(body.error.message, /积分不足/)
+})
+
+test("quotaErrorOf leaves a real reply alone", () => {
+  const res = new Response('{"choices":[{"message":{"content":"hi"}}]}', { status: 200 })
+  assert.equal(x.quotaErrorOf(res, 'data:{"choices":[{"delta":{"content":"hi"}}]}\n\n'), null)
+})
+
 // ---- OAuth callback server -------------------------------------------------
 
 test("startOAuthFlow serves a callback server and a valid login URL", async () => {

@@ -122,6 +122,10 @@ let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
 const SESSION_LIMIT_ERROR = "TM.00001041"
 // The temporary AK/SK/security-token went stale (IAM rejects the call).
 const STALE_TOKEN_ERROR = "APIG.0602"
+// The account is out of credits. The gateway answers HTTP 200 and puts the
+// error in the body — in an SSE frame when streaming — so without this a
+// caller sees a successful, empty reply and has no idea why.
+const QUOTA_ERROR = "InferHub.4291.200"
 // The gateway refuses a bigger output budget (RANGE_VALIDATOR: max_completion
 // tokens must be between 0 and 65536). Declaring no limit made callers pass
 // their own default, which is over it.
@@ -812,6 +816,25 @@ function releaseSlot(slot, key) {
   writeSlotFile(state)
 }
 
+/**
+ * A 2xx whose body is really an error frame (the gateway reports an exhausted
+ * credit balance that way, inside SSE when streaming). Return it as an HTTP
+ * error carrying the upstream message, or null when the body is a real reply.
+ */
+function quotaErrorOf(res, text) {
+  if (!text.includes(QUOTA_ERROR)) return null
+  const first = text.split("\n").map((l) => l.replace(/^data:\s*/, "")).find((l) => l.includes(QUOTA_ERROR))
+  const parsed = safeJson(first ?? "")
+  const msg = firstOf(parsed?.error_msg, "insufficient quota")
+  const headers = new Headers(res.headers)
+  headers.delete("content-type")
+  headers.set("content-type", "application/json; charset=utf-8")
+  return new Response(
+    JSON.stringify({ error: { message: `CodeArts: 积分不足 (${QUOTA_ERROR}), ${msg}`, type: "insufficient_quota", code: QUOTA_ERROR } }),
+    { status: 402, statusText: "Payment Required", headers },
+  )
+}
+
 /** Copy a response with `text` as its body, dropping stale length/encoding headers. */
 function textResponse(res, text) {
   const headers = new Headers(res.headers)
@@ -839,8 +862,9 @@ async function asSseChunks(res) {
     model: json.model,
     choices: json.choices.map((c, i) => ({
       index: c.index ?? i,
-      // Same reasoning-instead-of-content quirk as the streaming path.
-      delta: { role: "assistant", content: c.message?.content || c.message?.reasoning_content || "" },
+      // The reply only. Reasoning stays where it belongs (`reasoning_content`),
+      // never in content — the caller shows content as the answer.
+      delta: { role: "assistant", content: c.message?.content ?? "" },
       finish_reason: c.finish_reason ?? "stop",
     })),
     ...(json.usage ? { usage: json.usage } : {}),
@@ -976,7 +1000,10 @@ async function signedFetch(cred, input, init, context) {
   // streaming caller still reads a well-formed SSE body.
   if (streaming && !asStream && res.ok) {
     releaseSlot(slot, slotKey)
-    return asSseChunks(res)
+    const body = await res.clone().text()
+    const quota = quotaErrorOf(res, body)
+    if (quota) return quota
+    return asSseChunks(new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers }))
   }
   // The slot stays booked until the upstream ends the reply: the gateway keeps
   // counting the session until then, so a body nobody drains would hold it too.
@@ -985,9 +1012,34 @@ async function signedFetch(cred, input, init, context) {
     return res
   }
   const reader = res.body.getReader()
+  // The gateway can answer 200 with an error frame (exhausted credits) instead
+  // of a reply. Read ahead far enough to see the first frame, then decide.
+  const decoder = new TextDecoder()
+  const head = []
+  let headText = ""
+  while (headText.length < 2048 && !headText.includes("\n\n")) {
+    const { done, value } = await reader.read()
+    if (done) break
+    head.push(value)
+    headText += decoder.decode(value, { stream: true })
+  }
+  const quota = quotaErrorOf(res, headText)
+  if (quota) {
+    releaseSlot(slot, slotKey)
+    return quota
+  }
+  let replayed = false
   const stream = new ReadableStream({
     async pull(controller) {
       try {
+        if (!replayed) {
+          replayed = true
+          // Anything enqueued keeps the stream alive; the loop guard in pull()
+          // only needs the buffered bytes replayed once.
+          for (const chunk of head) controller.enqueue(chunk)
+          if (head.length === 0) controller.enqueue(new Uint8Array())
+          return
+        }
         const { done, value } = await reader.read()
         if (done) {
           releaseSlot(slot, slotKey)
@@ -1374,5 +1426,5 @@ export const _internal = {
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   sessionIdsFor, parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
-  SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS, MAX_OUTPUT_TOKENS,
+  SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS, MAX_OUTPUT_TOKENS, QUOTA_ERROR, quotaErrorOf,
 }
