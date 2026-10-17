@@ -336,6 +336,191 @@ test("loader returns nothing when not signed in", async () => {
   assert.deepEqual(await plugin.auth.loader(async () => ({ type: "api", key: "k" })), {})
 })
 
+// ---- session reuse + session-limit retry -----------------------------------
+
+const CHAT_URL = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions"
+const sessionLimitBody = JSON.stringify({
+  error_code: x.SESSION_LIMIT_ERROR,
+  error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。",
+})
+
+test("loader reuses one Chat-Id across requests instead of opening a session per call", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push(new Headers(init.headers).get("chat-id"))
+    return new Response("ok", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  for (let i = 0; i < 3; i++) {
+    await loaded.fetch(CHAT_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+    })
+  }
+  assert.equal(seen.length, 3)
+  assert.ok(seen[0], "every request must carry a Chat-Id")
+  assert.equal(seen[0], seen[1])
+  assert.equal(seen[0], seen[2])
+})
+
+test("signedFetch retries the session-limit error with backoff and succeeds", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    if (sends <= 2) return new Response(sessionLimitBody, { status: 400 })
+    return new Response("ok", { status: 200 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 200)
+  assert.equal(sends, 3)
+})
+
+test("signedFetch gives up after the backoff budget and returns the 400", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    return new Response(sessionLimitBody, { status: 400 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 400)
+  assert.equal(sends, 3) // the original send + one per injected delay
+  assert.ok((await res.text()).includes(x.SESSION_LIMIT_ERROR))
+})
+
+test("signedFetch does not retry session-limit-unrelated 400 errors", async () => {
+  const cred = await makeCred()
+  let sends = 0
+  const fetcher = async () => {
+    sends++
+    return new Response(JSON.stringify({ error_code: "TM.00009999", error_msg: "其他错误" }), { status: 400 })
+  }
+  const res = await x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [1, 1] })
+  assert.equal(res.status, 400)
+  assert.equal(sends, 1)
+  assert.ok((await res.text()).includes("TM.00009999"))
+})
+
+test("signedFetch aborts between session-limit retries", async () => {
+  const cred = await makeCred()
+  const controller = new AbortController()
+  const fetcher = async () => new Response(sessionLimitBody, { status: 400 })
+  const attempt = x.signedFetch(cred, CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2" }),
+    signal: controller.signal,
+  }, { chatId: "chat-1", sessionId: "sess-1", fetcher, retryDelays: [50] })
+  controller.abort()
+  await assert.rejects(attempt, { name: "AbortError" })
+})
+
+// ---- 401 self-heal ----------------------------------------------------------
+
+function stsResponse() {
+  return new Response(JSON.stringify({
+    credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: "2031-01-01T00:00:00Z" },
+    refresh_token: "R2",
+  }), { status: 200 })
+}
+
+test("loader force-refreshes the credential and retries once on a 401", async () => {
+  const cred = await makeCred()
+  const authz = []
+  let chats = 0
+  let stsCalls = 0
+  const fetcher = async (url, init) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      authz.push(new Headers(init.headers).get("authorization"))
+      if (chats === 1) {
+        return new Response(JSON.stringify({
+          error_code: "APIG.0301",
+          error_msg: "Incorrect IAM authentication information: verify ak sk signature fail",
+        }), { status: 401 })
+      }
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 200)
+  assert.equal(chats, 2)
+  assert.equal(stsCalls, 1)
+  // The retried request is signed with the refreshed credential.
+  assert.match(authz[0], /^SDK-HMAC-SHA256 Access=AK,/)
+  assert.match(authz[1], /^SDK-HMAC-SHA256 Access=AK2,/)
+})
+
+test("concurrent 401s share a single forced refresh", async () => {
+  const cred = await makeCred()
+  let chats = 0
+  let stsCalls = 0
+  const fetcher = async (url) => {
+    if (String(url).includes("/chat/completions")) {
+      chats++
+      if (chats <= 2) return new Response('{"error_code":"APIG.0301"}', { status: 401 })
+      return new Response("ok", { status: 200 })
+    }
+    stsCalls++
+    return stsResponse()
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const init = {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  }
+  const [a, b] = await Promise.all([loaded.fetch(CHAT_URL, init), loaded.fetch(CHAT_URL, init)])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.equal(stsCalls, 1)
+})
+
+test("loader marks the account expired when a refresh cannot save the 401", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    if (String(url).includes("/chat/completions")) {
+      return new Response('{"error_code":"APIG.0301"}', { status: 401 })
+    }
+    // The refresh token itself is dead.
+    return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(CHAT_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "GLM-5.2", messages: [] }),
+  })
+  assert.equal(res.status, 401)
+  assert.equal(new Headers(res.headers).get("x-magpie-sign-in"), "expired")
+})
+
 test("auth.refresh exchanges the refresh token for fresh credentials", async () => {
   const cred = await makeCred()
   const fetcher = async (url, init) => {

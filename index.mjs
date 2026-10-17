@@ -29,6 +29,11 @@
 //   5. Every model request is signed with SDK-HMAC-SHA256 in the loader's
 //      `fetch`, and the account's live model list + quota are read from
 //      signed GETs.
+//   6. The loader keeps ONE `Chat-Id` per account session: the gateway caps an
+//      account at 3 concurrent sessions keyed by that header, so reusing it
+//      keeps the plugin to a single slot. The session-limit error
+//      (TM.00001041) is retried with exponential backoff, and a 401 signature
+//      rejection triggers one forced credential refresh + retry.
 //
 // It imitates @magpie-community/opencode-workbuddy-auth for structure but
 // replaces its browser sign-in + bearer-token requests with CodeArts' OAuth +
@@ -91,6 +96,16 @@ const CORS_HEADERS = {
 // runtime; these are the known defaults so a cold start still works.
 const BENEFIT_MODEL_FALLBACK = ["glm-5.3-flash", "deepseek-v4.1-flash"]
 let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
+
+// The gateway counts every distinct `Chat-Id` as a concurrent session and caps
+// an account at 3; a finished session keeps its slot for a while after the
+// response. Opening a session per request therefore pinned the counter and
+// every further chat died with HTTP 400 TM.00001041 ("并发会话数已达上限(3个)").
+// The plugin now keeps one `Chat-Id` per loader (the gateway reuses the
+// session), and — for the slots other clients on the same account hold —
+// retries this error with exponential backoff before giving up.
+const SESSION_LIMIT_ERROR = "TM.00001041"
+const SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]
 
 // Context windows (in tokens), keyed by the exact chat model id. Models
 // without an entry leave the window to the backend's default.
@@ -611,15 +626,31 @@ function rememberBenefitIds(ids) {
   for (const id of ids) if (!benefitModelIds.includes(id)) benefitModelIds.push(id)
 }
 
+/** Wait `ms` (±25% jitter so concurrent callers do not sync up). */
+function sleepWithJitter(ms) {
+  return new Promise((r) => setTimeout(r, Math.round(ms * (0.75 + Math.random() * 0.5))))
+}
+
+/** Copy a response with `text` as its body, dropping stale length/encoding headers. */
+function textResponse(res, text) {
+  const headers = new Headers(res.headers)
+  for (const h of ["content-length", "content-encoding", "transfer-encoding"]) headers.delete(h)
+  return new Response(text, { status: res.status, statusText: res.statusText, headers })
+}
+
 /**
  * The plugin's per-request fetch: sign the outgoing chat request with the
- * account's temporary credentials, then send it.
+ * account's temporary credentials, then send it. A 400 that reports the
+ * upstream concurrent-session limit (TM.00001041) is retried with exponential
+ * backoff — the slots free up on their own — and every retry is re-signed so
+ * the `x-sdk-date` stamp stays current. `context.retryDelays` overrides the
+ * backoff schedule (tests).
  */
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
   const url = req ? req.url : String(input)
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
-  const headers = new Headers(init?.headers ?? req?.headers)
+  const baseHeaders = new Headers(init?.headers ?? req?.headers)
   let body
   if (init?.body != null) body = await toBytes(init.body)
   else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
@@ -627,23 +658,35 @@ async function signedFetch(cred, input, init, context) {
   const model = typeof init?.body === "string" ? safeJson(init.body)?.model : undefined
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
 
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    method, url, body, extra,
-  )
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
-  })
-  headers.set("Chat-Id", context.chatId)
-  headers.set("Session-Id", context.sessionId)
-  headers.set("lang", "en")
+  const send = async () => {
+    const signed = await signRequestHuawei(
+      cred.access_key_id, cred.secret_access_key, cred.security_token,
+      method, url, body, extra,
+    )
+    const headers = new Headers(baseHeaders)
+    signed.forEach((value, key) => {
+      if (key !== "host") headers.set(key, value)
+    })
+    headers.set("Chat-Id", context.chatId)
+    headers.set("Session-Id", context.sessionId)
+    headers.set("lang", "en")
+    return context.fetcher(url, {
+      ...init,
+      method,
+      headers,
+      ...(body.length > 0 ? { body } : {}),
+    })
+  }
 
-  const res = await context.fetcher(url, {
-    ...init,
-    method,
-    headers,
-    ...(body.length > 0 ? { body } : {}),
-  })
+  const delays = context.retryDelays ?? SESSION_RETRY_DELAYS_MS
+  let res = await send()
+  for (let attempt = 0; res.status === 400 && attempt < delays.length; attempt++) {
+    if (init?.signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError")
+    const text = await res.text()
+    if (!text.includes(SESSION_LIMIT_ERROR)) return textResponse(res, text)
+    await sleepWithJitter(delays[attempt])
+    res = await send()
+  }
   // A 401/403 is the sign-in gone; magpie marks the account from here.
   if (res.status === 401 || res.status === 403) {
     const h = new Headers(res.headers)
@@ -870,11 +913,14 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         let cred = credentialOf(auth)
         if (!cred?.access_key_id || !cred?.secret_access_key) return {}
 
-        // Kept for hosts that ignore `auth.refresh` (OpenCode / old magpie):
-        // refresh in-band when the credential is about to expire.
+        // Single-flight credential refresh, shared by the pre-expiry path and
+        // the 401 self-heal below. Failed attempts cool down so a dead
+        // refresh_token cannot turn every request into an STS loop.
         let refreshing = null
-        const current = async () => {
-          if (!cred.refresh_token || Date.parse(cred.expires_at || 0) - Date.now() > REFRESH_LEAD_MS) return cred
+        let refreshFailedAt = 0
+        const REFRESH_RETRY_COOLDOWN_MS = 10_000
+        const refreshNow = () => {
+          if (!cred.refresh_token) return Promise.resolve(null)
           if (!refreshing) {
             refreshing = refreshCredential(cred, fetcher)
               .then((next) => {
@@ -882,18 +928,42 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
                 void persistCredential(client, next)
                 return next
               })
-              .catch(() => cred)
+              .catch(() => {
+                refreshFailedAt = Date.now()
+                return null
+              })
               .finally(() => { refreshing = null })
           }
           return refreshing
         }
 
-        const context = { sessionId: randomHex(16), fetcher }
+        // Kept for hosts that ignore `auth.refresh` (OpenCode / old magpie):
+        // refresh in-band when the credential is about to expire.
+        const current = async () => {
+          if (!cred.refresh_token || Date.parse(cred.expires_at || 0) - Date.now() > REFRESH_LEAD_MS) return cred
+          return (await refreshNow()) ?? cred
+        }
+
+        // One session per loader: the gateway keys a session by `Chat-Id` and
+        // caps an account at 3 concurrent ones, so a per-request id piled up
+        // dead sessions until every chat was rejected (TM.00001041). Reusing
+        // one id per account keeps the plugin at a single slot, whatever the
+        // call frequency (the fetch below retries the residual error).
+        const context = { sessionId: randomHex(16), chatId: randomHex(16), fetcher }
         return {
           baseURL: CHAT_API_BASE,
           async fetch(input, init = {}) {
             const c = await current()
-            return signedFetch(c, input, init, { ...context, chatId: randomHex(16) })
+            let res = await signedFetch(c, input, init, context)
+            // A 401 here means the gateway rejected the signature — with IAM
+            // that is what an expired/rotated temporary credential looks like.
+            // Force one refresh and retry before reporting the response, so a
+            // missed scheduled refresh does not brick the account.
+            if (res.status === 401 && Date.now() - refreshFailedAt > REFRESH_RETRY_COOLDOWN_MS) {
+              const next = await refreshNow()
+              if (next) res = await signedFetch(next, input, init, context)
+            }
+            return res
           },
         }
       },
@@ -984,4 +1054,5 @@ export const _internal = {
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
+  SESSION_LIMIT_ERROR, SESSION_RETRY_DELAYS_MS,
 }
